@@ -59,6 +59,45 @@ class EventAck(BaseModel):
     stream: StreamStateOut
 
 
+class EventBatchIn(BaseModel):
+    events: list[EventIn] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="1-100 events, validated and written in input order; "
+        "event_id and sequence must each be unique within the batch",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "events": [
+                        {"event_id": "evt-1", "sequence": 0, "delta": 100},
+                        {"event_id": "evt-2", "sequence": 1, "delta": -30},
+                    ]
+                }
+            ]
+        }
+    }
+
+
+class EventBatchItemOut(BaseModel):
+    event_id: str
+    sequence: int
+    status: str = Field(
+        ..., description='"created" for a new event, "replayed" for an idempotent replay'
+    )
+
+
+class EventBatchAck(BaseModel):
+    status: str
+    results: list[EventBatchItemOut] = Field(
+        ..., description="One outcome per submitted event, in input order"
+    )
+    stream: StreamStateOut = Field(..., description="Final stream state after the batch")
+
+
 class ClaimIn(BaseModel):
     max_events: int = Field(
         ..., ge=1, le=10_000, description="Maximum number of events in this batch"
@@ -367,6 +406,47 @@ def submit_event(stream_id: str, event: EventIn):
     ).model_dump()
     # Idempotent replays return 200; first-time inserts return 201.
     return JSONResponse(payload, status_code=200 if replayed else 201)
+
+
+@app.post(
+    "/streams/{stream_id}/event-batches",
+    response_model=EventBatchAck,
+    status_code=201,
+    responses={
+        200: {
+            "model": EventBatchAck,
+            "description": "Every event in the batch was an idempotent replay",
+        }
+    },
+    tags=["events"],
+    summary="Submit a batch of 1-100 events atomically",
+)
+def submit_event_batch(stream_id: str, batch: EventBatchIn):
+    try:
+        state, results = repo.submit_event_batch(
+            stream_id,
+            [repo.BatchEvent(e.event_id, e.sequence, e.delta) for e in batch.events],
+        )
+    except repo.ConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: the UNIQUE constraints map to a 409 as well.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+
+    payload = EventBatchAck(
+        status="ok",
+        results=[EventBatchItemOut(**item.as_dict()) for item in results],
+        stream=StreamStateOut(**state.as_dict()),
+    ).model_dump()
+    # A batch that only replays returns 200; any created event means 201.
+    all_replayed = all(item.status == "replayed" for item in results)
+    return JSONResponse(payload, status_code=200 if all_replayed else 201)
 
 
 @app.get(

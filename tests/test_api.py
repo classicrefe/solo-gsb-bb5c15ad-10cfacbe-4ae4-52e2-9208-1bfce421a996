@@ -2063,3 +2063,324 @@ def test_snapshot_export_unicode_stream_id_round_trip(client):
     assert [e["sequence"] for e in last["events"]] == [2]
     assert last["balance"] == 24
     assert last["next_cursor"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Event batches: POST /streams/{stream_id}/event-batches
+# --------------------------------------------------------------------------- #
+
+
+def _ev(event_id, sequence, delta):
+    return {"event_id": event_id, "sequence": sequence, "delta": delta}
+
+
+def _post_batch(client, stream_id, events):
+    return client.post(f"/streams/{stream_id}/event-batches", json={"events": events})
+
+
+def test_batch_creates_stream_and_events_in_order(client):
+    r = _post_batch(
+        client,
+        "b-new",
+        [_ev("e0", 0, 100), _ev("e1", 1, -30), _ev("e2", 2, 50)],
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["results"] == [
+        {"event_id": "e0", "sequence": 0, "status": "created"},
+        {"event_id": "e1", "sequence": 1, "status": "created"},
+        {"event_id": "e2", "sequence": 2, "status": "created"},
+    ]
+    assert body["stream"] == {
+        "stream_id": "b-new",
+        "balance": 120,
+        "next_sequence": 3,
+        "pending_sequences": [],
+    }
+    # The batch created the stream; it is queryable afterwards.
+    assert client.get("/streams/b-new").json()["balance"] == 120
+
+
+def test_batch_out_of_order_events_caught_up_once(client):
+    # Sequences arrive scrambled inside one batch: a single catch-up pass
+    # after the whole batch was written applies every contiguous event.
+    r = _post_batch(
+        client,
+        "b-ooo",
+        [_ev("e2", 2, 30), _ev("e0", 0, 10), _ev("e1", 1, 20)],
+    )
+    assert r.status_code == 201
+    body = r.json()
+    # Results follow the input order, not sequence order.
+    assert [item["event_id"] for item in body["results"]] == ["e2", "e0", "e1"]
+    assert all(item["status"] == "created" for item in body["results"])
+    assert body["stream"]["balance"] == 60
+    assert body["stream"]["next_sequence"] == 3
+    assert body["stream"]["pending_sequences"] == []
+
+
+def test_batch_with_gap_leaves_tail_pending(client):
+    r = _post_batch(client, "b-gap", [_ev("e0", 0, 10), _ev("e2", 2, 30)])
+    assert r.status_code == 201
+    body = r.json()
+    assert body["stream"]["balance"] == 10
+    assert body["stream"]["next_sequence"] == 1
+    assert body["stream"]["pending_sequences"] == [2]
+
+    # A later batch closes the gap: one catch-up applies e1 and the parked e2.
+    r = _post_batch(client, "b-gap", [_ev("e1", 1, 20)])
+    assert r.status_code == 201
+    assert r.json()["stream"] == {
+        "stream_id": "b-gap",
+        "balance": 60,
+        "next_sequence": 3,
+        "pending_sequences": [],
+    }
+
+
+def test_batch_closes_gap_from_earlier_pending_events(client):
+    _post(client, "b-park", "e1", 1, 200)  # parked behind the gap at 0
+    _post(client, "b-park", "e2", 2, 50)
+
+    r = _post_batch(client, "b-park", [_ev("e0", 0, 100)])
+    assert r.status_code == 201
+    body = r.json()
+    assert body["results"] == [{"event_id": "e0", "sequence": 0, "status": "created"}]
+    assert body["stream"]["balance"] == 350
+    assert body["stream"]["next_sequence"] == 3
+    assert body["stream"]["pending_sequences"] == []
+
+
+def test_batch_replays_pending_event_and_creates_gap_closer(client):
+    _post(client, "b-mix", "e1", 1, 20)  # parked, not yet applied
+
+    # e1 replays (same content) while e0 is new and closes the gap.
+    r = _post_batch(client, "b-mix", [_ev("e1", 1, 20), _ev("e0", 0, 10)])
+    assert r.status_code == 201
+    body = r.json()
+    assert body["results"] == [
+        {"event_id": "e1", "sequence": 1, "status": "replayed"},
+        {"event_id": "e0", "sequence": 0, "status": "created"},
+    ]
+    assert body["stream"]["balance"] == 30
+    assert body["stream"]["next_sequence"] == 2
+    assert body["stream"]["pending_sequences"] == []
+
+
+def test_batch_all_replayed_returns_200(client):
+    _post(client, "b-rep", "e0", 0, 10)
+    _post(client, "b-rep", "e1", 1, 20)
+
+    r = _post_batch(client, "b-rep", [_ev("e1", 1, 20), _ev("e0", 0, 10)])
+    assert r.status_code == 200
+    body = r.json()
+    assert [item["status"] for item in body["results"]] == ["replayed", "replayed"]
+    assert body["stream"]["balance"] == 30
+    assert body["stream"]["next_sequence"] == 2
+
+
+def test_batch_mixed_created_and_replayed_returns_201(client):
+    _post(client, "b-mixed", "e0", 0, 10)
+
+    r = _post_batch(client, "b-mixed", [_ev("e0", 0, 10), _ev("e1", 1, 5)])
+    assert r.status_code == 201
+    body = r.json()
+    assert [item["status"] for item in body["results"]] == ["replayed", "created"]
+    assert body["stream"]["balance"] == 15
+    assert body["stream"]["next_sequence"] == 2
+
+
+def test_batch_replay_conflict_rolls_back_whole_batch(client):
+    _post(client, "b-rc", "e0", 0, 10)
+
+    # e1 is new, but e0's delta contradicts the stored event -> 409, and the
+    # whole batch (including e1) must not survive.
+    r = _post_batch(client, "b-rc", [_ev("e1", 1, 20), _ev("e0", 0, 999)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "replay_conflict"
+
+    state = client.get("/streams/b-rc").json()
+    assert state["balance"] == 10
+    assert state["next_sequence"] == 1
+    assert state["pending_sequences"] == []
+
+    # e1 was rolled back with the batch, so submitting it now creates it.
+    assert _post(client, "b-rc", "e1", 1, 20).status_code == 201
+
+
+def test_batch_sequence_conflict_rolls_back_whole_batch(client):
+    _post(client, "b-sc", "e0", 0, 10)
+
+    # Sequence 0 is already occupied by e0; e1 must not be left behind either.
+    r = _post_batch(client, "b-sc", [_ev("e1", 1, 20), _ev("e2", 0, 5)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "sequence_conflict"
+
+    state = client.get("/streams/b-sc").json()
+    assert state["balance"] == 10
+    assert state["next_sequence"] == 1
+    assert state["pending_sequences"] == []
+    assert _post(client, "b-sc", "e1", 1, 20).status_code == 201
+
+
+def test_batch_conflict_leaves_no_balance_change(client):
+    _post(client, "b-atomic", "e0", 0, 100)
+    _post(client, "b-atomic", "e2", 2, 30)  # parked behind the gap at 1
+
+    # Would close the gap and apply e2, but the last item conflicts -> nothing
+    # of this batch may be applied or parked.
+    r = _post_batch(
+        client,
+        "b-atomic",
+        [_ev("e1", 1, 20), _ev("e3", 3, 40), _ev("e0", 0, 100), _ev("e2", 2, 31)],
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "replay_conflict"
+
+    state = client.get("/streams/b-atomic").json()
+    assert state["balance"] == 100
+    assert state["next_sequence"] == 1
+    assert state["pending_sequences"] == [2]
+
+
+def test_batch_duplicate_event_id_within_batch_returns_409(client):
+    r = _post_batch(client, "b-dupid", [_ev("e0", 0, 1), _ev("e0", 1, 2)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "duplicate_event_id"
+    # Nothing was written: the stream was never created.
+    assert client.get("/streams/b-dupid").status_code == 404
+
+    # Identical duplicates are rejected too (batch items must be unique).
+    r = _post_batch(client, "b-dupid2", [_ev("e0", 0, 1), _ev("e0", 0, 1)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "duplicate_event_id"
+    assert client.get("/streams/b-dupid2").status_code == 404
+
+
+def test_batch_duplicate_sequence_within_batch_returns_409(client):
+    r = _post_batch(client, "b-dupseq", [_ev("e0", 0, 1), _ev("e1", 0, 2)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "duplicate_sequence"
+    assert client.get("/streams/b-dupseq").status_code == 404
+
+
+def test_batch_size_validation(client):
+    assert _post_batch(client, "b-size", []).status_code == 422
+    assert _post_batch(client, "b-size", [_ev(f"e{i}", i, 1) for i in range(101)]).status_code == 422
+    assert client.get("/streams/b-size").status_code == 404
+
+    # Boundaries: 1 and 100 events are accepted.
+    r = _post_batch(client, "b-size1", [_ev("e0", 0, 1)])
+    assert r.status_code == 201
+    r = _post_batch(client, "b-size100", [_ev(f"e{i}", i, 1) for i in range(100)])
+    assert r.status_code == 201
+    assert r.json()["stream"]["next_sequence"] == 100
+    assert r.json()["stream"]["balance"] == 100
+
+
+def test_batch_item_validation_rejects_bad_payloads(client):
+    assert _post_batch(client, "b-val", [_ev("", 0, 1)]).status_code == 422
+    assert _post_batch(client, "b-val", [_ev("e", -1, 1)]).status_code == 422
+    assert _post_batch(client, "b-val", [_ev("e", 0, "not-an-int")]).status_code == 422
+    assert _post_batch(client, "b-val", [_ev("e", True, 1)]).status_code == 422
+    assert _post_batch(client, "b-val", [_ev("e", 0, False)]).status_code == 422
+    assert _post_batch(client, "b-val", [{"event_id": "e", "sequence": 0}]).status_code == 422
+    assert client.post("/streams/b-val/event-batches", json={}).status_code == 422
+    assert client.get("/streams/b-val").status_code == 404
+
+
+def test_batch_sealed_stream_allows_full_replay_only(client):
+    _post(client, "b-sealed", "e0", 0, 10)
+    _post(client, "b-sealed", "e1", 1, 20)
+    assert _seal(client, "b-sealed", "seal-b", 2).status_code == 201
+
+    # A batch that only replays pre-seal events still returns the original result.
+    r = _post_batch(client, "b-sealed", [_ev("e0", 0, 10), _ev("e1", 1, 20)])
+    assert r.status_code == 200
+    assert [item["status"] for item in r.json()["results"]] == ["replayed", "replayed"]
+
+    # Any new event in the batch rejects the whole batch...
+    r = _post_batch(client, "b-sealed", [_ev("e0", 0, 10), _ev("e2", 2, 30)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+
+    # ...regardless of the new event's position in the batch.
+    r = _post_batch(client, "b-sealed", [_ev("e2", 2, 30), _ev("e0", 0, 10)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+
+    state = client.get("/streams/b-sealed").json()
+    assert state["balance"] == 30
+    assert state["next_sequence"] == 2
+    assert state["pending_sequences"] == []
+
+
+def test_batch_events_are_consumable_like_normal_events(client):
+    _post_batch(client, "b-cons", [_ev("e0", 0, 10), _ev("e1", 1, 20)])
+
+    r = client.post("/streams/b-cons/consumers/w/claim", json={"max_events": 10})
+    assert r.status_code == 200
+    claim = r.json()
+    assert [(e["event_id"], e["sequence"], e["delta"]) for e in claim["events"]] == [
+        ("e0", 0, 10),
+        ("e1", 1, 20),
+    ]
+    r = client.post(
+        "/streams/b-cons/consumers/w/ack", json={"lease_token": claim["lease_token"]}
+    )
+    assert r.status_code == 200
+    assert r.json()["cursor"] == 2
+
+
+def test_concurrent_identical_batches_create_events_exactly_once(client):
+    import threading
+
+    batch = [_ev(f"e{i}", i, 1) for i in range(5)]
+    statuses = []
+
+    def post():
+        statuses.append(_post_batch(client, "b-conc", batch).status_code)
+
+    threads = [threading.Thread(target=post) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one batch created the events; the rest are pure replays.
+    assert statuses.count(201) == 1
+    assert statuses.count(200) == 19
+    state = client.get("/streams/b-conc").json()
+    assert state["balance"] == 5
+    assert state["next_sequence"] == 5
+    assert state["pending_sequences"] == []
+
+
+def test_concurrent_disjoint_batches_apply_each_sequence_once(client):
+    import threading
+
+    errors = []
+
+    def post(base):
+        try:
+            r = _post_batch(
+                client,
+                "b-disjoint",
+                [_ev(f"e{base}", base, 1), _ev(f"e{base + 1}", base + 1, 1)],
+            )
+            assert r.status_code == 201
+        except Exception:  # noqa: BLE001 - collected and asserted below
+            errors.append(base)
+
+    threads = [threading.Thread(target=post, args=(i * 2,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    state = client.get("/streams/b-disjoint").json()
+    assert state["balance"] == 20
+    assert state["next_sequence"] == 20
+    assert state["pending_sequences"] == []
