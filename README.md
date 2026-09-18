@@ -67,6 +67,14 @@
   `base64url(规范JSON).base64url(HMAC-SHA256)`，绑定 `stream_id`、快照上界与下一序号；
   签名损坏、跨流使用或字段非法返回 `400`，流不存在返回 `404`。签名密钥从环境变量
   `SNAPSHOT_CURSOR_SECRET` 读取（Compose 已提供可用默认值）。
+- **原子批量提交（event batch）**：`POST /streams/{stream_id}/event-batches` 一次提交
+  1～100 个事件，批内 `event_id` 与 `sequence` 必须各自唯一。整批在**同一个
+  `BEGIN IMMEDIATE` 事务**中按输入顺序校验并写入：已有事件内容相同记为
+  `replayed`，内容不一致（`replay_conflict`）或序号被占用（`sequence_conflict`）
+  返回 `409` 且**整体回滚**——不留下本批新事件或余额变化；全部通过后只执行**一次**
+  连续追赶。响应按输入顺序返回每项的 `created`/`replayed` 状态及最终流状态：全为
+  重放返回 `200`，否则 `201`。封存流允许全量重放，但只要包含新事件就整体拒绝
+  （`409 stream_sealed`）。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -603,6 +611,54 @@ JSON**（键序固定、紧凑分隔符无空白、UTF-8、非 ASCII 字符原�
 - `404 Not Found`：`stream_not_found`——流不存在（无论是否携带游标）；
 - `422 Unprocessable Entity`：`limit` 越界或不是整数。
 
+### 12. 批量提交事件（event batch）
+
+```
+POST /streams/{stream_id}/event-batches
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段     | 类型           | 约束                                       | 说明                           |
+| -------- | -------------- | ------------------------------------------ | ------------------------------ |
+| `events` | array[object]  | `1 <= len(events) <= 100`，批内 `event_id` 与 `sequence` 各自唯一 | 按输入顺序校验并写入的事件列表 |
+
+每个数组元素与单事件接口的请求体相同：`event_id`（非空字符串）、`sequence`
+（`>= 0` 的整数）、`delta`（整数）。
+
+整批在**同一个 `BEGIN IMMEDIATE` 事务**中处理：按输入顺序逐个校验并写入（已有
+事件内容相同记为 `replayed`；内容不一致或序号被占用即整批回滚），全部通过后只
+执行**一次**连续追赶。任一事件冲突都不会留下本批的新事件或余额变化。
+
+```json
+{
+  "status": "ok",
+  "results": [
+    {"event_id": "e0", "sequence": 0, "status": "created"},
+    {"event_id": "e1", "sequence": 1, "status": "replayed"}
+  ],
+  "stream": {"stream_id": "acct-1", "balance": 300, "next_sequence": 2, "pending_sequences": []}
+}
+```
+
+- `results`：与输入一一对应、按输入顺序排列的逐项结果，`status` 为
+  `created`（首次写入）或 `replayed`（幂等重放）；
+- `stream`：整批写入并完成唯一一次追赶后的最终流状态；
+- `201 Created`：批中至少一个事件是首次写入；
+- `200 OK`：批中**全部**事件都是幂等重放（不重复累加）；
+- `409 Conflict`：`replay_conflict`（某 `event_id` 已存在但内容不一致）、
+  `sequence_conflict`（某 `sequence` 已被其他 `event_id` 占用）或
+  `stream_sealed`（封存流的批中含新事件）——**整批回滚**，不写入任何事件；
+- `422 Unprocessable Entity`：批大小越界（空批或超过 100）、批内 `event_id`/
+  `sequence` 重复，或某个事件字段校验失败。
+
+封存流的语义与单事件接口一致：批中**全部**是封存前已存在事件的相同内容时按
+全量重放处理（`200`）；只要包含一个新事件，整批以 `409 stream_sealed` 拒绝。
+
+批量提交不新增任何表：批内事件就是 `events` 表中的普通行，写入后可被查询、
+消费（claim/ack）、快照导出、分叉、撤销等既有接口正常观察。
+
 ## 工作机制示例
 
 ```bash
@@ -1044,6 +1100,62 @@ curl -s -i 'localhost:8000/streams/ghost/events'
 # HTTP/1.1 404 -> {"detail":{"code":"stream_not_found", ...}}
 ```
 
+## 批量提交示例（event batch）
+
+```bash
+# 一批提交 3 个乱序事件：同一事务内写入并一次追赶完成
+curl -s -X POST localhost:8000/streams/acct-b/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e3","sequence":3,"delta":40}'   # 先造一个缺号暂存（缺 0~2）
+curl -s -X POST localhost:8000/streams/acct-b/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"e2","sequence":2,"delta":30},
+        {"event_id":"e0","sequence":0,"delta":10},
+        {"event_id":"e1","sequence":1,"delta":20}]}'
+# 201:
+# {"status":"ok",
+#  "results":[{"event_id":"e2","sequence":2,"status":"created"},
+#             {"event_id":"e0","sequence":0,"status":"created"},
+#             {"event_id":"e1","sequence":1,"status":"created"}],
+#  "stream":{"stream_id":"acct-b","balance":100,"next_sequence":4,"pending_sequences":[]}}
+# 缺号 0~2 在批内补齐，暂存的 e3 也被同一次追赶一并应用
+
+# 混合批：e0 重放、e4 新写 —— 逐项标注，整体 201
+curl -s -X POST localhost:8000/streams/acct-b/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"e0","sequence":0,"delta":10},
+        {"event_id":"e4","sequence":4,"delta":50}]}'
+# 201 -> results[0].status="replayed", results[1].status="created", balance=150
+
+# 全部为重放：200，余额不变
+curl -s -i -X POST localhost:8000/streams/acct-b/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"e1","sequence":1,"delta":20},
+        {"event_id":"e0","sequence":0,"delta":10}]}'
+# HTTP/1.1 200 OK
+
+# 批中任一事件冲突：整批 409 回滚，e5 不会写入、余额不变
+curl -s -i -X POST localhost:8000/streams/acct-b/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"e5","sequence":5,"delta":60},
+        {"event_id":"e0","sequence":0,"delta":999}]}'
+# HTTP/1.1 409 -> {"detail":{"code":"replay_conflict", ...}}
+curl -s localhost:8000/streams/acct-b
+# -> balance=150, next_sequence=5, pending_sequences=[]（无 e5 残留）
+
+# 批内 event_id/sequence 重复、空批、超过 100 个事件：422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/streams/acct-b/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+        {"event_id":"e6","sequence":5,"delta":1},
+        {"event_id":"e7","sequence":5,"delta":2}]}'
+# 422
+```
+
 ## 数据模型
 
 ```text
@@ -1163,6 +1275,21 @@ ack 成功时除推进游标、清空租约外，还会删除 `sequence < 新游
    `applied=1`，直到遇到缺号；
 5. 更新 `balance` 与 `next_sequence`，提交事务。
 
+批量提交复用同一套校验，在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 若流不存在则创建（`balance=0, next_sequence=0`）；
+2. 按**输入顺序**逐个处理批内事件：`event_id` 已存在且内容一致记为
+   `replayed`（不写库），内容不一致即 `replay_conflict`；新事件先检查封存
+   （`stream_sealed`）与序号占用（`sequence_conflict`），通过后写入
+   `applied=0` 的事件；
+3. 任一事件冲突都抛出异常，事务整体回滚——本批已写入的新事件、余额与
+   `next_sequence` 变化全部撤销，已暂存事件不受影响；
+4. 全部通过后只执行**一次**连续追赶（批内补齐的缺号与之前暂存的事件链一并
+   应用），更新 `balance`/`next_sequence` 后统一提交；
+5. 响应按输入顺序返回每项 `created`/`replayed` 与最终流状态：全为重放返回
+   `200`，否则 `201`。批大小（1～100）与批内 `event_id`/`sequence` 唯一性由
+   请求体校验保证（`422`），因此批内不会自相冲突。
+
 分叉的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
 
 1. 锁定并读取源流：不存在直接返回 `404`（事务内不做任何写入）；
@@ -1279,7 +1406,13 @@ pytest -q
 ```
 
 `tests/test_api.py` 覆盖：顺序累加、缺号暂存与自动追赶、幂等重放、两种 409、
-404、422 参数校验、大批量追赶以及 20 线程并发；消费者游标部分覆盖：领取连续批次、
+404、422 参数校验、大批量追赶以及 20 线程并发；批量提交部分覆盖：批内乱序一次
+追赶、部分事件仍暂存、新建/重放混合逐项状态、全重放 `200`、批中
+`replay_conflict`/`sequence_conflict` 整体回滚（含不留下本批新事件、余额与
+暂存状态不变、本可触发的追赶一并撤销）、空批/超 100/批内重复/字段非法 `422`
+且不建流、100 个事件上界、封存流全量重放 `200` 但含新事件 `409 stream_sealed`、
+批写事件与单事件/消费接口互通，以及 10 线程并发批量提交每个序号恰好应用一次；
+消费者游标部分覆盖：领取连续批次、
 缺号时只返回已应用事件、租约内重复领取同批同 token、ack 推进游标、错误/旧/过期
 token 的三种 409、租约到期后同批重新领取、多消费者独立游标、空批次以及 20 线程
 并发只产生一个有效租约；消费拒绝（nack）部分覆盖：阈值内 nack 不推进游标且重领
@@ -1329,6 +1462,7 @@ python3 verify_reversals.py
 python3 verify_seals.py
 python3 verify_snapshots.py
 python3 verify_nacks.py
+python3 verify_batches.py
 ```
 
 ## 项目结构
@@ -1338,7 +1472,7 @@ python3 verify_nacks.py
 ├── app/
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与请求/响应模型
-│   ├── repo.py        # 归并/追赶算法（纯 sqlite3，事务边界清晰）
+│   ├── repo.py        # 归并/追赶算法：单事件与原子批量提交（纯 sqlite3，事务边界清晰）
 │   ├── forks.py       # 流分叉（fork）幂等事务
 │   ├── transfers.py   # 跨事件流原子转账（transfer）幂等事务
 │   ├── reversals.py   # 事件撤销（reversal）幂等事务
@@ -1355,6 +1489,7 @@ python3 verify_nacks.py
 ├── verify_seals.py
 ├── verify_snapshots.py
 ├── verify_nacks.py
+├── verify_batches.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

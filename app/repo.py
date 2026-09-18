@@ -137,6 +137,79 @@ def get_stream_state(stream_id: str) -> StreamState | None:
         )
 
 
+def _ensure_stream(conn: sqlite3.Connection, stream_id: str) -> tuple[int, int]:
+    """Return the stream's ``(balance, next_sequence)``, creating the row first."""
+    stream = _get_stream(conn, stream_id)
+    if stream is None:
+        conn.execute(
+            "INSERT INTO streams (stream_id, balance, next_sequence) VALUES (?, 0, 0)",
+            (stream_id,),
+        )
+        return 0, 0
+    return stream["balance"], stream["next_sequence"]
+
+
+def _store_event(
+    conn: sqlite3.Connection,
+    stream_id: str,
+    event_id: str,
+    sequence: int,
+    delta: int,
+) -> bool:
+    """Validate one event against the stored state and insert it when new.
+
+    Returns True when the event already existed with identical content (an
+    idempotent replay; nothing is written). Raises :class:`ConflictError` when
+    the event contradicts what is stored. Must run inside an open write
+    transaction.
+    """
+    existing = _get_event(conn, stream_id, event_id)
+    if existing is not None:
+        # Idempotent replay: same event_id must carry identical content.
+        if existing["sequence"] != sequence or existing["delta"] != delta:
+            raise ConflictError(
+                "replay_conflict",
+                "event_id already exists with different sequence/delta",
+            )
+        return True
+
+    # Sealing is irreversible: a sealed stream rejects any *new* event.
+    # Completed operations stay replayable because they take the branch
+    # above without writing.
+    if is_sealed(conn, stream_id):
+        raise ConflictError(
+            "stream_sealed",
+            f"stream {stream_id!r} is sealed and cannot accept new events",
+        )
+    clash = _get_event_by_sequence(conn, stream_id, sequence)
+    if clash is not None:
+        # The UNIQUE(stream_id, sequence) index also guards this, but
+        # producing a clear error here keeps the response informative.
+        raise ConflictError(
+            "sequence_conflict",
+            f"sequence {sequence} already occupied by event_id "
+            f"{clash['event_id']!r}",
+        )
+    conn.execute(
+        "INSERT INTO events (stream_id, event_id, sequence, delta, applied) "
+        "VALUES (?, ?, ?, ?, 0)",
+        (stream_id, event_id, sequence, delta),
+    )
+    return False
+
+
+def _catch_up(
+    conn: sqlite3.Connection, stream_id: str, balance: int, next_sequence: int
+) -> StreamState:
+    """Run the contiguous catch-up and persist the resulting stream row."""
+    balance, expected = apply_contiguous(conn, stream_id, balance, next_sequence)
+    conn.execute(
+        "UPDATE streams SET balance = ?, next_sequence = ? WHERE stream_id = ?",
+        (balance, expected, stream_id),
+    )
+    return build_state(conn, stream_id, balance, expected)
+
+
 def submit_event(
     stream_id: str, event_id: str, sequence: int, delta: int
 ) -> tuple[StreamState, bool]:
@@ -146,57 +219,31 @@ def submit_event(
     already stored (an idempotent replay). Raises ``ConflictError`` on 409 cases.
     """
     with db.write_transaction() as conn:
-        stream = _get_stream(conn, stream_id)
-        if stream is None:
-            conn.execute(
-                "INSERT INTO streams (stream_id, balance, next_sequence) VALUES (?, 0, 0)",
-                (stream_id,),
-            )
-            balance, next_sequence = 0, 0
-        else:
-            balance, next_sequence = stream["balance"], stream["next_sequence"]
-
-        existing = _get_event(conn, stream_id, event_id)
-        if existing is not None:
-            # Idempotent replay: same event_id must carry identical content.
-            if existing["sequence"] != sequence or existing["delta"] != delta:
-                raise ConflictError(
-                    "replay_conflict",
-                    "event_id already exists with different sequence/delta",
-                )
-            replayed = True
-        else:
-            # Sealing is irreversible: a sealed stream rejects any *new* event.
-            # Completed operations stay replayable because they take the branch
-            # above without writing.
-            if is_sealed(conn, stream_id):
-                raise ConflictError(
-                    "stream_sealed",
-                    f"stream {stream_id!r} is sealed and cannot accept new events",
-                )
-            clash = _get_event_by_sequence(conn, stream_id, sequence)
-            if clash is not None:
-                # The UNIQUE(stream_id, sequence) index also guards this, but
-                # producing a clear error here keeps the response informative.
-                raise ConflictError(
-                    "sequence_conflict",
-                    f"sequence {sequence} already occupied by event_id "
-                    f"{clash['event_id']!r}",
-                )
-            conn.execute(
-                "INSERT INTO events (stream_id, event_id, sequence, delta, applied) "
-                "VALUES (?, ?, ?, ?, 0)",
-                (stream_id, event_id, sequence, delta),
-            )
-            replayed = False
-
+        balance, next_sequence = _ensure_stream(conn, stream_id)
+        replayed = _store_event(conn, stream_id, event_id, sequence, delta)
         # Contiguous catch-up, executed inside the same transaction.
-        balance, expected = apply_contiguous(conn, stream_id, balance, next_sequence)
-
-        conn.execute(
-            "UPDATE streams SET balance = ?, next_sequence = ? WHERE stream_id = ?",
-            (balance, expected, stream_id),
-        )
-
-        state = build_state(conn, stream_id, balance, expected)
+        state = _catch_up(conn, stream_id, balance, next_sequence)
         return state, replayed
+
+
+def submit_event_batch(
+    stream_id: str, events: list[tuple[str, int, int]]
+) -> tuple[StreamState, list[str]]:
+    """Persist a batch of events atomically, then run one contiguous catch-up.
+
+    ``events`` holds ``(event_id, sequence, delta)`` triples that are validated
+    and written in input order inside a single ``BEGIN IMMEDIATE`` transaction.
+    Returns ``(state, statuses)`` where ``statuses`` aligns with the input and
+    holds ``"created"``/``"replayed"`` per event. The first clash raises
+    ``ConflictError`` and rolls the whole batch back: a rejected batch leaves
+    no new events and no balance changes behind.
+    """
+    with db.write_transaction() as conn:
+        balance, next_sequence = _ensure_stream(conn, stream_id)
+        statuses: list[str] = []
+        for event_id, sequence, delta in events:
+            replayed = _store_event(conn, stream_id, event_id, sequence, delta)
+            statuses.append("replayed" if replayed else "created")
+        # A single contiguous catch-up covers every event stored above.
+        state = _catch_up(conn, stream_id, balance, next_sequence)
+        return state, statuses

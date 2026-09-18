@@ -142,6 +142,223 @@ def test_concurrent_submissions_apply_each_sequence_once(client):
 
 
 # --------------------------------------------------------------------------- #
+# Atomic event batches
+# --------------------------------------------------------------------------- #
+
+
+def _ev(event_id, sequence, delta):
+    return {"event_id": event_id, "sequence": sequence, "delta": delta}
+
+
+def _post_batch(client, stream_id, events):
+    return client.post(f"/streams/{stream_id}/event-batches", json={"events": events})
+
+
+def test_batch_creates_stream_and_applies_events_in_order(client):
+    r = _post_batch(client, "sb-new", [_ev("e0", 0, 100), _ev("e1", 1, -30)])
+    assert r.status_code == 201
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["results"] == [
+        {"event_id": "e0", "sequence": 0, "status": "created"},
+        {"event_id": "e1", "sequence": 1, "status": "created"},
+    ]
+    assert body["stream"] == {
+        "stream_id": "sb-new",
+        "balance": 70,
+        "next_sequence": 2,
+        "pending_sequences": [],
+    }
+
+
+def test_batch_catches_up_once_for_out_of_order_events(client):
+    # The gap closes inside the batch: one catch-up applies everything.
+    r = _post_batch(
+        client, "sb-gap", [_ev("e2", 2, 50), _ev("e0", 0, 100), _ev("e1", 1, 200)]
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert [item["status"] for item in body["results"]] == ["created"] * 3
+    assert body["stream"]["balance"] == 350
+    assert body["stream"]["next_sequence"] == 3
+    assert body["stream"]["pending_sequences"] == []
+
+    # A batch may also leave events pending behind a remaining gap.
+    r = _post_batch(
+        client, "sb-gap2", [_ev("e1", 1, 20), _ev("e3", 3, 40), _ev("e0", 0, 10)]
+    )
+    assert r.status_code == 201
+    stream = r.json()["stream"]
+    assert stream["balance"] == 30
+    assert stream["next_sequence"] == 2
+    assert stream["pending_sequences"] == [3]
+
+
+def test_batch_mixed_created_and_replayed_reports_each_in_input_order(client):
+    _post(client, "sb-mix", "e0", 0, 10)
+
+    r = _post_batch(client, "sb-mix", [_ev("e0", 0, 10), _ev("e1", 1, 5)])
+    assert r.status_code == 201
+    body = r.json()
+    assert body["results"] == [
+        {"event_id": "e0", "sequence": 0, "status": "replayed"},
+        {"event_id": "e1", "sequence": 1, "status": "created"},
+    ]
+    assert body["stream"]["balance"] == 15
+    assert body["stream"]["next_sequence"] == 2
+
+
+def test_batch_of_pure_replays_returns_200(client):
+    _post(client, "sb-rep", "e0", 0, 10)
+    _post(client, "sb-rep", "e1", 1, 20)
+
+    r = _post_batch(client, "sb-rep", [_ev("e1", 1, 20), _ev("e0", 0, 10)])
+    assert r.status_code == 200
+    body = r.json()
+    assert [item["status"] for item in body["results"]] == ["replayed", "replayed"]
+    assert body["stream"]["balance"] == 30
+    assert body["stream"]["next_sequence"] == 2
+
+
+def test_batch_replay_conflict_rolls_back_whole_batch(client):
+    _post(client, "sb-conf", "e0", 0, 10)
+
+    # e1 is new and valid, but e0 contradicts the stored content: the whole
+    # batch is rejected and nothing is written.
+    r = _post_batch(client, "sb-conf", [_ev("e1", 1, 5), _ev("e0", 0, 999)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "replay_conflict"
+
+    state = client.get("/streams/sb-conf").json()
+    assert state["balance"] == 10
+    assert state["next_sequence"] == 1
+    assert state["pending_sequences"] == []
+
+
+def test_batch_sequence_conflict_rolls_back_whole_batch(client):
+    _post(client, "sb-seq", "e0", 0, 10)
+
+    # e1 would be inserted, but sequence 0 is already occupied by e0: the
+    # conflict rolls back e1 as well.
+    r = _post_batch(client, "sb-seq", [_ev("e1", 1, 5), _ev("e2", 0, 7)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "sequence_conflict"
+
+    state = client.get("/streams/sb-seq").json()
+    assert state["balance"] == 10
+    assert state["next_sequence"] == 1
+    assert state["pending_sequences"] == []
+
+
+def test_batch_conflict_rolls_back_the_would_be_catch_up(client):
+    # Seed a gap: e1 is buffered behind the missing sequence 0.
+    _post(client, "sb-atomic", "e1", 1, 100)
+
+    # e0 would close the gap, but e1's replay content is wrong: 409, the
+    # buffered e1 stays unapplied and no new event survives.
+    r = _post_batch(client, "sb-atomic", [_ev("e0", 0, 50), _ev("e1", 1, 999)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "replay_conflict"
+
+    state = client.get("/streams/sb-atomic").json()
+    assert state["balance"] == 0
+    assert state["next_sequence"] == 0
+    assert state["pending_sequences"] == [1]
+
+
+def test_batch_validation_rejects_bad_payloads(client):
+    # Empty batch and oversized batch.
+    assert _post_batch(client, "sb-val", []).status_code == 422
+    assert (
+        _post_batch(client, "sb-val", [_ev(f"e{i}", i, 1) for i in range(101)]).status_code
+        == 422
+    )
+    # event_id and sequence must each be unique within the batch.
+    assert _post_batch(client, "sb-val", [_ev("e0", 0, 1), _ev("e0", 1, 2)]).status_code == 422
+    assert _post_batch(client, "sb-val", [_ev("e0", 0, 1), _ev("e1", 0, 2)]).status_code == 422
+    # Item-level validation matches the single-event endpoint.
+    assert _post_batch(client, "sb-val", [_ev("", 0, 1)]).status_code == 422
+    assert _post_batch(client, "sb-val", [_ev("e0", -1, 1)]).status_code == 422
+    assert _post_batch(client, "sb-val", [_ev("e0", 0, "not-an-int")]).status_code == 422
+    assert _post_batch(client, "sb-val", [_ev("e0", True, 1)]).status_code == 422
+    # Missing events key / wrong container type.
+    assert client.post("/streams/sb-val/event-batches", json={}).status_code == 422
+    assert client.post("/streams/sb-val/event-batches", json={"events": {}}).status_code == 422
+    # Rejected payloads wrote nothing: the stream was never created.
+    assert client.get("/streams/sb-val").status_code == 404
+
+
+def test_batch_of_100_events_is_accepted(client):
+    r = _post_batch(client, "sb-100", [_ev(f"e{i}", i, 1) for i in range(100)])
+    assert r.status_code == 201
+    body = r.json()
+    assert len(body["results"]) == 100
+    assert all(item["status"] == "created" for item in body["results"])
+    assert body["stream"]["balance"] == 100
+    assert body["stream"]["next_sequence"] == 100
+
+
+def test_batch_on_sealed_stream_full_replay_ok_but_new_event_rejected(client):
+    _post(client, "sb-sealed", "e0", 0, 10)
+    _post(client, "sb-sealed", "e1", 1, 20)
+    r = client.post(
+        "/streams/sb-sealed/seal",
+        json={"seal_id": "seal-1", "expected_next_sequence": 2},
+    )
+    assert r.status_code == 201
+
+    # A batch that only replays stored events is still allowed.
+    r = _post_batch(client, "sb-sealed", [_ev("e1", 1, 20), _ev("e0", 0, 10)])
+    assert r.status_code == 200
+    assert [item["status"] for item in r.json()["results"]] == ["replayed", "replayed"]
+
+    # Any new event in the batch rejects the whole batch.
+    r = _post_batch(client, "sb-sealed", [_ev("e0", 0, 10), _ev("e2", 2, 30)])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    state = client.get("/streams/sb-sealed").json()
+    assert state["balance"] == 30
+    assert state["next_sequence"] == 2
+    assert state["pending_sequences"] == []
+
+
+def test_batch_events_interoperate_with_single_event_and_consumer_apis(client):
+    _post_batch(client, "sb-interop", [_ev("e0", 0, 100), _ev("e2", 2, 50)])
+
+    # The single-event endpoint replays/conflicts against batch-written
+    # events exactly like against its own writes.
+    assert _post(client, "sb-interop", "e0", 0, 100).status_code == 200
+    assert _post(client, "sb-interop", "other", 2, 50).status_code == 409
+    # Closing the gap with a single event applies the buffered batch event.
+    r = _post(client, "sb-interop", "e1", 1, 200)
+    assert r.status_code == 201
+    assert r.json()["stream"]["balance"] == 350
+    assert r.json()["stream"]["pending_sequences"] == []
+
+    # Consumers claim batch-written events like any other applied events.
+    r = client.post("/streams/sb-interop/consumers/w/claim", json={"max_events": 10})
+    assert [e["event_id"] for e in r.json()["events"]] == ["e0", "e1", "e2"]
+
+
+def test_concurrent_batches_apply_each_sequence_once(client):
+    import threading
+
+    def post_batch(base):
+        _post_batch(client, "sb-conc", [_ev(f"e{base}", base, 1), _ev(f"e{base + 1}", base + 1, 1)])
+
+    threads = [threading.Thread(target=post_batch, args=(i,)) for i in range(0, 20, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    state = client.get("/streams/sb-conc").json()
+    assert state["next_sequence"] == 20
+    assert state["balance"] == 20
+    assert state["pending_sequences"] == []
+
+
+# --------------------------------------------------------------------------- #
 # Consumer cursor: claim / ack leases
 # --------------------------------------------------------------------------- #
 

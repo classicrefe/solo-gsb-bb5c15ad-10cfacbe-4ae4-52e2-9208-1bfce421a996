@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -57,6 +58,64 @@ class EventAck(BaseModel):
     status: str
     replayed: bool
     stream: StreamStateOut
+
+
+class EventBatchIn(BaseModel):
+    events: list[EventIn] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="1-100 events validated and written atomically in input order",
+    )
+
+    @field_validator("events")
+    @classmethod
+    def _unique_within_batch(cls, value):
+        # event_id and sequence must each be unique across the batch; the
+        # per-item constraints are validated by EventIn itself.
+        seen_ids: set[str] = set()
+        seen_sequences: set[int] = set()
+        for item in value:
+            if item.event_id in seen_ids:
+                raise ValueError(
+                    f"duplicate event_id {item.event_id!r} within the batch"
+                )
+            if item.sequence in seen_sequences:
+                raise ValueError(
+                    f"duplicate sequence {item.sequence} within the batch"
+                )
+            seen_ids.add(item.event_id)
+            seen_sequences.add(item.sequence)
+        return value
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "events": [
+                        {"event_id": "evt-1", "sequence": 0, "delta": 100},
+                        {"event_id": "evt-2", "sequence": 1, "delta": -30},
+                    ]
+                }
+            ]
+        }
+    }
+
+
+class BatchEventResultOut(BaseModel):
+    event_id: str
+    sequence: int
+    status: Literal["created", "replayed"]
+
+
+class EventBatchOut(BaseModel):
+    status: str
+    results: list[BatchEventResultOut] = Field(
+        ..., description="Per-event outcome aligned with the input order"
+    )
+    stream: StreamStateOut = Field(
+        ..., description="Final stream state after the single catch-up"
+    )
 
 
 class ClaimIn(BaseModel):
@@ -367,6 +426,52 @@ def submit_event(stream_id: str, event: EventIn):
     ).model_dump()
     # Idempotent replays return 200; first-time inserts return 201.
     return JSONResponse(payload, status_code=200 if replayed else 201)
+
+
+@app.post(
+    "/streams/{stream_id}/event-batches",
+    response_model=EventBatchOut,
+    status_code=201,
+    responses={
+        200: {
+            "model": EventBatchOut,
+            "description": "Every event in the batch was an idempotent replay",
+        }
+    },
+    tags=["events"],
+    summary="Submit a batch of events atomically for a stream",
+)
+def submit_event_batch(stream_id: str, batch: EventBatchIn):
+    try:
+        state, statuses = repo.submit_event_batch(
+            stream_id,
+            [(item.event_id, item.sequence, item.delta) for item in batch.events],
+        )
+    except repo.ConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: the UNIQUE constraints map to a 409 as well.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+
+    payload = EventBatchOut(
+        status="ok",
+        results=[
+            BatchEventResultOut(
+                event_id=item.event_id, sequence=item.sequence, status=status
+            )
+            for item, status in zip(batch.events, statuses)
+        ],
+        stream=StreamStateOut(**state.as_dict()),
+    ).model_dump()
+    # A batch that only replays existing events returns 200; any new event -> 201.
+    all_replayed = all(status == "replayed" for status in statuses)
+    return JSONResponse(payload, status_code=200 if all_replayed else 201)
 
 
 @app.get(
